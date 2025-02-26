@@ -1,6 +1,9 @@
 using Microsoft.AspNetCore.Mvc;
 using Octokit;
 using System.Net.Http.Headers;
+using Newtonsoft.Json;
+using System.Text;
+using System.IO;
 
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
@@ -39,25 +42,58 @@ app.MapPost("/agent", async (
             "user messages as if you were one code reviewer."
     });
 
-    userRequest.Messages.Insert(0, new Message
+    Dictionary<string, string> userPipelineMap = new Dictionary<string, string>
     {
-        Role = "system",
-        Content = 
-            "When user types 'typo check' or '1', you should replay '#1 typo checking' and review if code lines of currently opened file has typo"
-    });
-    
-    userRequest.Messages.Insert(0, new Message
-    {
-        Role = "system",
-        Content = 
-            "When user types 'null check' or '2', you should reply '#2 null checking' and review if code lines of currently opened file handle null reference exception carefully"
-    });
+        { "1. typo check", "Pls check if currently opened file has typo" },
+        { "2. null check", "Pls check if currently opened file handles null reference exception carefully" },
+        { "3. Fallback logic check", "Pls check fallback logic in currently opened file to see if there is any potential issue" },
+        { "4. Config check", "Pls check if there is any potential issue for currently opened file if it is config file" }
+    };
 
+    Dictionary<string, string> resultMap = new Dictionary<string, string>
+    {
+        { "1. typo check", "TODO" },
+        { "2. null check", "TODO" },
+        { "3. Fallback logic check", "TODO" },
+        { "4. Config check", "TODO" }
+    };
+    
+    foreach (var userPipeline in userPipelineMap)
+    {
+        userRequest.Messages.Insert(0, new Message
+        {
+            Role = "user",
+            Content = userPipeline.Value
+        });
+
+        // get result
+        var rawHttpClient = new HttpClient();
+        rawHttpClient.DefaultRequestHeaders.Authorization = 
+            new AuthenticationHeaderValue("Bearer", githubToken);
+        userRequest.Stream = true;
+
+        var rawCopilotLLMResponse = await rawHttpClient.PostAsJsonAsync(
+            githubCopilotCompletionsUrl, userRequest);
+
+        if (rawCopilotLLMResponse.IsSuccessStatusCode)
+        {
+            string rawResponseString = 
+                await rawCopilotLLMResponse.Content.ReadAsStringAsync();
+            resultMap[userPipeline.Key] = rawResponseString;
+        }
+        else
+        {
+            resultMap[userPipeline.Key] = "Error: Unable to get response";
+        }
+    }
+
+    string rawResult = JsonConvert.SerializeObject(resultMap);
     userRequest.Messages.Insert(0, new Message
     {
-        Role = "system",
+        Role = "user",
         Content = 
-            "When user types 'sdp' or 'sdl', you should reply 'reviewing with SDP' and review if code lines of currently opened file has typo first and then review handle null reference exception carefully"
+            "Pls summarize the review results in a table format."
+            + "\n" + rawResult
     });
 
     var httpClient = new HttpClient();
@@ -68,9 +104,14 @@ app.MapPost("/agent", async (
     var copilotLLMResponse = await httpClient.PostAsJsonAsync(
         githubCopilotCompletionsUrl, userRequest);
 
-    var responseStream = 
-        await copilotLLMResponse.Content.ReadAsStreamAsync();
-    return Results.Stream(responseStream, "application/json");
+    var responseStreamString = 
+        await copilotLLMResponse.Content.ReadAsStringAsync();
+    
+    // Raw result + Summarized result
+    string fullResult = rawResult + responseStreamString;
+    Stream fullResultStream = new MemoryStream(Encoding.UTF8.GetBytes(fullResult));
+
+    return Results.Stream(fullResultStream, "application/json");
 });
 
 app.MapGet("/callback", () => "You may close this tab and " + 
